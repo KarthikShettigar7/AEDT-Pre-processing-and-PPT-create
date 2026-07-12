@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+Phase 3 - combined GUI (Report PPT + AEDT setup)
+================================================
+One app that clubs Phase 1 (PowerPoint report) and Phase 2 (Icepak automation):
+
+  * Create PPT   -> builds Thermal_Report.pptx from the material Excel
+                    (cover + material property + boundary-conditions section).
+  * Setup AEDT   -> imports the CAD, applies materials / emissivity / thermal
+                    modifier / priority / mesh / gravity / convection region +
+                    openings / natural-or-forced setup / thermal blocks / BC,
+                    then saves & closes AEDT.
+  * Run Both     -> PPT first, then AEDT.
+
+The material Excel, CAD, PPT path and AEDT version are remembered between runs
+in phase3_gui_config.json beside this script. Logic lives in phase1_core.py and
+phase2_core.py (copies of the two standalone apps).
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import sys
+import threading
+import traceback
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+
+import phase1_core as p1   # noqa: E402
+import phase2_core as p2   # noqa: E402
+
+CONFIG_PATH = os.path.join(_HERE, "phase3_gui_config.json")
+KNOWN_VERSIONS = ["2025.2", "2025.1", "2024.2", "2024.1", "2023.2", "2023.1"]
+DEFAULT_EXCEL = os.path.join(_HERE, "Material Data for Simulation.xlsx")
+DEFAULT_CAD = os.path.join(_HERE, "Phase2_cad.stp")
+DEFAULT_PPT = os.path.join(_HERE, "Thermal_Report.pptx")
+
+BG = "#f4f6f8"
+CARD = "#ffffff"
+ACCENT = "#c00000"
+INK = "#1f2937"
+MUTE = "#6b7280"
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _QueueWriter:
+    def __init__(self, q):
+        self.q = q
+
+    def write(self, s):
+        if s:
+            self.q.put(s)
+
+    def flush(self):
+        pass
+
+
+class Phase3GUI:
+    def __init__(self, root):
+        self.root = root
+        self.cfg = load_config()
+        self.log_q: queue.Queue = queue.Queue()
+        self.worker: threading.Thread | None = None
+
+        root.title("Phase 3  -  Thermal Report + AEDT Setup")
+        root.configure(bg=BG)
+        root.minsize(780, 660)
+
+        self._style()
+        self._header()
+        self._form()
+        self._actions()
+        self._logbox()
+
+        self._load_fields()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(80, self._drain)
+
+    # ---- style / layout
+    def _style(self):
+        st = ttk.Style()
+        try:
+            st.theme_use("clam")
+        except Exception:  # noqa: BLE001
+            pass
+        st.configure("TFrame", background=BG)
+        st.configure("TLabel", background=CARD, foreground=INK, font=("Segoe UI", 10))
+        st.configure("Head.TLabel", background=BG, foreground=INK, font=("Segoe UI Semibold", 17))
+        st.configure("Sub.TLabel", background=BG, foreground=MUTE, font=("Segoe UI", 9))
+        st.configure("Field.TLabel", background=CARD, foreground=MUTE, font=("Segoe UI", 9))
+        st.configure("TCheckbutton", background=CARD, foreground=INK, font=("Segoe UI", 10))
+        st.configure("TRadiobutton", background=CARD, foreground=INK, font=("Segoe UI", 10))
+        st.configure("Run.TButton", font=("Segoe UI Semibold", 11), foreground="#ffffff",
+                     background=ACCENT, borderwidth=0, padding=(16, 9))
+        st.map("Run.TButton", background=[("active", "#9e0000"), ("disabled", "#d9a3a3")])
+        st.configure("Sec.TButton", font=("Segoe UI", 10), padding=(12, 7))
+        st.configure("TButton", font=("Segoe UI", 9), padding=(10, 5))
+
+    def _header(self):
+        top = tk.Frame(self.root, bg=BG)
+        top.pack(fill="x", padx=20, pady=(16, 6))
+        ttk.Label(top, text="Phase 3  -  Report + AEDT", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(top, text="Create the PowerPoint report, then set up the Icepak model "
+                            "from one shared Excel.", style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+        tk.Frame(self.root, bg=ACCENT, height=3).pack(fill="x", padx=20)
+
+    def _card(self):
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill="x", padx=20, pady=(12, 0))
+        card = tk.Frame(outer, bg=CARD, highlightbackground="#e5e7eb", highlightthickness=1)
+        card.pack(fill="x")
+        return card
+
+    def _form(self):
+        card = self._card()
+        card.columnconfigure(1, weight=1)
+        pad = dict(padx=14, pady=7)
+
+        ttk.Label(card, text="AEDT VERSION", style="Field.TLabel").grid(row=0, column=0, sticky="w", **pad)
+        self.version = ttk.Combobox(card, values=KNOWN_VERSIONS, state="normal",
+                                    font=("Segoe UI", 10), width=14)
+        self.version.grid(row=0, column=1, sticky="w", **pad)
+
+        self.excel = self._file_row(card, 1, "MATERIAL EXCEL", self._pick_excel)
+        self.cad = self._file_row(card, 2, "CAD (STEP) FILE", self._pick_cad)
+        self.ppt = self._file_row(card, 3, "PPT OUTPUT", self._pick_ppt)
+
+        # simulation type (for the PPT material table) + options
+        opt = tk.Frame(card, bg=CARD)
+        opt.grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 10))
+        ttk.Label(opt, text="PPT sim type:", style="Field.TLabel").pack(side="left", padx=(4, 6))
+        self.sim = tk.StringVar(value=p1.SIM_HEAT)
+        ttk.Radiobutton(opt, text="Heat Generation", value=p1.SIM_HEAT,
+                        variable=self.sim).pack(side="left")
+        ttk.Radiobutton(opt, text="Joule Heating", value=p1.SIM_JOULE,
+                        variable=self.sim).pack(side="left", padx=(6, 14))
+        self.show_gui = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="Show AEDT window", variable=self.show_gui).pack(side="left")
+        self.import_cad = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="Import CAD", variable=self.import_cad).pack(side="left", padx=(14, 0))
+
+    def _file_row(self, card, r, label, cmd):
+        ttk.Label(card, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=14, pady=7)
+        row = tk.Frame(card, bg=CARD)
+        row.grid(row=r, column=1, sticky="ew", padx=14, pady=7)
+        row.columnconfigure(0, weight=1)
+        ent = ttk.Entry(row, font=("Segoe UI", 10))
+        ent.grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="Browse", command=cmd).grid(row=0, column=1, padx=(8, 0))
+        return ent
+
+    def _actions(self):
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x", padx=20, pady=(14, 4))
+        self.b_ppt = ttk.Button(bar, text="1 - Create PPT", style="Sec.TButton",
+                                command=lambda: self._start("ppt"))
+        self.b_ppt.pack(side="left")
+        self.b_aedt = ttk.Button(bar, text="2 - Setup AEDT", style="Sec.TButton",
+                                 command=lambda: self._start("aedt"))
+        self.b_aedt.pack(side="left", padx=(8, 0))
+        self.b_both = ttk.Button(bar, text="Run Both  (PPT -> AEDT)", style="Run.TButton",
+                                 command=lambda: self._start("both"))
+        self.b_both.pack(side="left", padx=(14, 0))
+        self.status = ttk.Label(bar, text="Ready", style="Sub.TLabel")
+        self.status.pack(side="left", padx=14)
+
+    def _logbox(self):
+        wrap = tk.Frame(self.root, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=20, pady=(8, 16))
+        self.log = tk.Text(wrap, bg="#0f172a", fg="#e2e8f0", insertbackground="#e2e8f0",
+                           font=("Consolas", 9), relief="flat", wrap="word", height=15)
+        self.log.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(wrap, command=self.log.yview)
+        sb.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=sb.set, state="disabled")
+
+    # ---- fields <-> config
+    def _load_fields(self):
+        self.version.set(self.cfg.get("version", "2025.2"))
+        self.excel.insert(0, self.cfg.get("excel", DEFAULT_EXCEL))
+        self.cad.insert(0, self.cfg.get("cad", DEFAULT_CAD))
+        self.ppt.insert(0, self.cfg.get("ppt", DEFAULT_PPT))
+        # default the PPT sim type from the BC sheet's Simulation value
+        try:
+            simbc = p2.read_bc_simulation(self.excel.get().strip())
+            self.sim.set(p1.SIM_JOULE if simbc == "joule_heating" else p1.SIM_HEAT)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _cfg(self):
+        return {"version": self.version.get().strip(), "excel": self.excel.get().strip(),
+                "cad": self.cad.get().strip(), "ppt": self.ppt.get().strip()}
+
+    def _pick_excel(self):
+        f = filedialog.askopenfilename(title="Material Excel",
+                                       filetypes=[("Excel", "*.xlsx *.xlsm"), ("All", "*.*")],
+                                       initialdir=os.path.dirname(self.excel.get() or _HERE))
+        if f:
+            self.excel.delete(0, "end")
+            self.excel.insert(0, f)
+
+    def _pick_cad(self):
+        f = filedialog.askopenfilename(title="CAD file",
+                                       filetypes=[("STEP / CAD", "*.stp *.step *.igs *.iges *.x_t *.sat"),
+                                                  ("All", "*.*")],
+                                       initialdir=os.path.dirname(self.cad.get() or _HERE))
+        if f:
+            self.cad.delete(0, "end")
+            self.cad.insert(0, f)
+
+    def _pick_ppt(self):
+        f = filedialog.asksaveasfilename(title="PPT output", defaultextension=".pptx",
+                                         initialfile=os.path.basename(self.ppt.get() or "Thermal_Report.pptx"),
+                                         initialdir=os.path.dirname(self.ppt.get() or _HERE),
+                                         filetypes=[("PowerPoint", "*.pptx")])
+        if f:
+            self.ppt.delete(0, "end")
+            self.ppt.insert(0, f)
+
+    # ---- logging
+    def _append(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _drain(self):
+        try:
+            while True:
+                self._append(self.log_q.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(80, self._drain)
+
+    # ---- run
+    def _busy(self):
+        return self.worker and self.worker.is_alive()
+
+    def _start(self, mode):
+        if self._busy():
+            return
+        cfg = self._cfg()
+        if not os.path.isfile(cfg["excel"]):
+            messagebox.showerror("Missing Excel", f"Excel not found:\n{cfg['excel']}")
+            return
+        if mode in ("aedt", "both"):
+            if not cfg["version"]:
+                messagebox.showerror("Version", "Enter an AEDT version (e.g. 2025.2).")
+                return
+            if self.import_cad.get() and not os.path.isfile(cfg["cad"]):
+                messagebox.showerror("Missing CAD", f"CAD not found:\n{cfg['cad']}")
+                return
+        save_config(cfg)
+        for b in (self.b_ppt, self.b_aedt, self.b_both):
+            b.configure(state="disabled")
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self.status.configure(text="Running ...")
+        self.worker = threading.Thread(target=self._work, args=(mode, cfg), daemon=True)
+        self.worker.start()
+
+    def _do_ppt(self, cfg):
+        print("=== CREATE PPT ===")
+        mats, src = p1.load_materials(cfg["excel"])
+        print(f"materials: {len(mats)} ({src})")
+        out = cfg["ppt"] or DEFAULT_PPT
+        p1.build_deck(mats, self.sim.get(), out, data_path=cfg["excel"])
+        print(f"[PPT] saved -> {out}")
+
+    def _do_aedt(self, cfg):
+        print("\n=== SETUP AEDT ===")
+        args = p2.build_parser().parse_args([])
+        args.version = cfg["version"]
+        args.excel = cfg["excel"]
+        args.cad = cfg["cad"]
+        args.non_graphical = not self.show_gui.get()
+        args.new_desktop = True
+        args.no_import = not self.import_cad.get()
+        args.save = True
+        args.close = True
+        p2.run(args)
+
+    def _work(self, mode, cfg):
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = _QueueWriter(self.log_q)
+        ok = False
+        try:
+            if mode in ("ppt", "both"):
+                self._do_ppt(cfg)
+            if mode in ("aedt", "both"):
+                self._do_aedt(cfg)
+            ok = True
+        except Exception:  # noqa: BLE001
+            print("\n[Phase3] FAILED:\n" + traceback.format_exc())
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            self.root.after(0, self._done, ok, mode)
+
+    def _done(self, ok, mode):
+        for b in (self.b_ppt, self.b_aedt, self.b_both):
+            b.configure(state="normal")
+        self.status.configure(text="Done" if ok else "Finished with errors")
+        if ok:
+            msg = {"ppt": "PPT created.", "aedt": "AEDT set up, saved & closed.",
+                   "both": "PPT created, then AEDT set up, saved & closed."}[mode]
+            messagebox.showinfo("Phase 3", msg)
+        else:
+            messagebox.showwarning("Phase 3", "Finished with errors. See the log.")
+
+    def _on_close(self):
+        save_config(self._cfg())
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    Phase3GUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
