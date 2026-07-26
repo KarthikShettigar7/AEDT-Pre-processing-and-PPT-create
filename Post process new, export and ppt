@@ -1,0 +1,1046 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import os
+import re
+import sys
+import json
+import queue
+import tempfile
+import threading
+import time
+import traceback
+import pandas as pd
+import builtins
+
+from ansys.aedt.core import Icepak
+from ansys.aedt.core.modules.design_xploration import SetupParam
+
+str = builtins.str
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+# Results-section PPT builder (needs python-pptx). Kept optional so the export
+# side of the tool still runs if python-pptx is not installed.
+try:
+    import ppt_report_core as ppt_core
+    _PPT_IMPORT_ERROR = None
+except Exception as _err:
+    ppt_core = None
+    _PPT_IMPORT_ERROR = _err
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+MANIFEST_NAME = "export_manifest.json"
+DEFAULT_TEMPLATE = os.path.join(_HERE, "Report_Template.pptx")
+
+# Top-right corner of the rendered image, as a fraction of width/height, where
+# AEDT stamps "Ansys <version> R<n>". There is no API or view option that turns
+# this off (checked: ExportModelImageToFile takes no logo argument, and AEDT's
+# View3D/DefaultAttributesR18/ShowLogo has no effect on the export), so it is
+# painted out afterwards instead.
+LOGO_BOX = (0.84, 0.0, 1.0, 0.075)
+
+
+oProject = None
+stop_event = threading.Event()
+worker = None
+# tkinter is NOT thread-safe: the worker thread must never touch a widget (not
+# even app.after). It posts messages here and the main thread drains them.
+ui_queue = queue.Queue()
+# Export progress, owned by the MAIN thread only (the worker just posts counts).
+export_state = {"done": 0, "total": 0, "t0": None, "running": False}
+
+
+MAIN_RED = "#E6001A"
+DARKER_RED = "#B0000E"
+BLACK = "#121212"
+WHITE = "#FFFFFF"
+LIGHT_GREEN = "#74D400"
+
+
+ctk.set_appearance_mode("dark")
+app = ctk.CTk()
+app.title("Thermatic: AEDT Parametric Plot Exporter")
+app.geometry("900x720")
+app.configure(fg_color=BLACK)
+app.resizable(False, False)
+
+
+app.update_idletasks()
+w, h = 780, 800
+x = (app.winfo_screenwidth() // 2) - (w // 2)
+y = (app.winfo_screenheight() // 2) - (h // 2)
+app.geometry(f"{w}x{h}+{x}+{y}")
+
+
+ctk.CTkLabel(
+    app,
+    text="AEDT Parametric Plot Export",
+    font=("Sitka Small", 24),
+    text_color=WHITE
+).pack(pady=20)
+
+input_frame = ctk.CTkFrame(app, fg_color="transparent")
+input_frame.pack()
+
+
+aedt_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+aedt_frame.pack(pady=8)
+
+aedt_entry = ctk.CTkEntry(
+    aedt_frame, width=300, height=30,
+    placeholder_text="Browse AEDT File",
+    font=("Sitka Small", 12),
+    justify="center"
+)
+aedt_entry.pack(side="left", padx=(0, 6))
+
+def browse_aedt():
+    p = filedialog.askopenfilename(filetypes=[("AEDT", "*.aedt")])
+    if p:
+        aedt_entry.delete(0, tk.END)
+        aedt_entry.insert(0, p)
+
+ctk.CTkButton(
+    aedt_frame, text="AEDT Browse",
+    width=100, height=30,
+    fg_color=MAIN_RED, hover_color=DARKER_RED,
+    font=("Sitka Small", 12),
+    command=browse_aedt
+).pack(side="left")
+
+
+csv_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+csv_frame.pack(pady=8)
+
+csv_entry = ctk.CTkEntry(
+    csv_frame, width=300, height=30,
+    placeholder_text="Optional: Browse CSV File (Parametric Table)",
+    font=("Sitka Small", 12),
+    justify="center"
+)
+csv_entry.pack(side="left", padx=(0, 6))
+
+def browse_csv():
+    p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+    if p:
+        csv_entry.delete(0, tk.END)
+        csv_entry.insert(0, p)
+
+ctk.CTkButton(
+    csv_frame, text="CSV Browse",
+    width=100, height=30,
+    fg_color=MAIN_RED, hover_color=DARKER_RED,
+    font=("Sitka Small", 12),
+    command=browse_csv
+).pack(side="left")
+
+
+ppt_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+ppt_frame.pack(pady=8)
+
+ppt_entry = ctk.CTkEntry(
+    ppt_frame, width=300, height=30,
+    placeholder_text="Browse Report Template (PPTX)",
+    font=("Sitka Small", 12),
+    justify="center"
+)
+ppt_entry.pack(side="left", padx=(0, 6))
+if os.path.isfile(DEFAULT_TEMPLATE):
+    ppt_entry.insert(0, DEFAULT_TEMPLATE)
+
+def browse_ppt():
+    p = filedialog.askopenfilename(filetypes=[("PowerPoint", "*.pptx")])
+    if p:
+        ppt_entry.delete(0, tk.END)
+        ppt_entry.insert(0, p)
+
+ctk.CTkButton(
+    ppt_frame, text="PPT Browse",
+    width=100, height=30,
+    fg_color=MAIN_RED, hover_color=DARKER_RED,
+    font=("Sitka Small", 12),
+    command=browse_ppt
+).pack(side="left")
+
+
+use_csv_var = ctk.BooleanVar(value=True)
+ctk.CTkCheckBox(
+    app,
+    text="Use CSV (OFF = Auto Input)",
+    variable=use_csv_var,
+    text_color=WHITE,
+    font=("Sitka Small", 12),
+    fg_color=LIGHT_GREEN,
+    checkmark_color="black",
+    hover_color=LIGHT_GREEN
+).pack(pady=10)
+
+
+orientation_var = ctk.StringVar(value="isometric")
+
+ctk.CTkLabel(
+    app,
+    text="Orientations (Ex: isometric, View1, View2)",
+    font=("Sitka Small", 12),
+    text_color=WHITE
+).pack()
+
+orientation_entry = ctk.CTkEntry(
+    app,
+    width=300,
+    placeholder_text="isometric, View1, View2",
+    font=("Sitka Small", 12),
+    justify="center",
+    textvariable=orientation_var
+)
+orientation_entry.pack(pady=6)
+
+preview_frame = ctk.CTkFrame(app, fg_color="#1A1A1A")
+preview_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+ctk.CTkLabel(
+    preview_frame,
+    text="Export Preview (Select the plots to Exported)",
+    font=("Sitka Small", 16),
+    text_color=WHITE
+).pack(pady=8)
+
+canvas = tk.Canvas(preview_frame, bg="#1A1A1A", highlightthickness=0)
+scroll = ctk.CTkScrollbar(preview_frame, orientation="vertical", command=canvas.yview)
+table = ctk.CTkFrame(canvas, fg_color="#1A1A1A")
+
+table.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+canvas.create_window((0, 0), window=table, anchor="nw")
+canvas.configure(yscrollcommand=scroll.set)
+
+canvas.pack(side="left", fill="both", expand=True)
+scroll.pack(side="right", fill="y")
+
+preview_rows = []
+
+def load_parametric_table(aedt, csvf, use_csv):
+    global oProject
+
+    if oProject is None:
+        oProject = Icepak(
+            project=aedt,
+            version="2025.2",
+            non_graphical=False,
+            new_desktop=True,
+            close_on_exit=False,
+            remove_lock=True
+        )
+
+    if use_csv:
+        df = pd.read_csv(csvf)
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        tmp.close()
+        SetupParam(oProject, "ParametricSetup1").export_to_csv(tmp.name)
+        df = pd.read_csv(tmp.name)
+        os.remove(tmp.name)
+
+    df = df.drop(columns=[c for c in df.columns if c.strip() == "*"], errors="ignore")
+    df.index += 1
+    return df
+
+def build_filename(row_idx, row, orientation, quantity):
+    parts = [str(row_idx)]
+    for k, v in row.items():
+        if pd.notna(v):
+            parts.extend([str(k), str(v)])
+    parts.append(orientation)
+    parts.append(quantity)
+    return "_".join(parts) + ".jpg"
+
+INVALID_PATH_CHARS = '<>:"/\\|?*'
+
+def sanitize_path_part(text, max_len=60):
+    s = str(text)
+    for ch in INVALID_PATH_CHARS:
+        s = s.replace(ch, "_")
+    s = re.sub(r"\s+", "_", s).strip("._ ")
+    return s[:max_len] if s else "unnamed"
+
+def build_variation_dir(row_idx, row):
+    parts = ["Design_" + str(row_idx)]
+    for k, v in row.items():
+        if pd.notna(v):
+            parts.extend([sanitize_path_part(k, 24), sanitize_path_part(v, 24)])
+    return sanitize_path_part("_".join(parts), 110)
+
+def build_export_dir(base_dir, design_name, row_idx, row):
+    return os.path.join(
+        base_dir,
+        sanitize_path_part(design_name, 50),
+        build_variation_dir(row_idx, row)
+    )
+
+def build_preview(df):
+    for w in table.winfo_children():
+        w.destroy()
+    preview_rows.clear()
+
+    post = oProject.post
+    plots = []
+    for name, fp in post.field_plots.items():
+        plots.append({
+            "plot": name,
+            "folder": fp.plot_folder,
+            "quantity": fp.quantity,
+            "surfaces": list(getattr(fp, "surfaces", []))
+        })
+
+    plots_df = pd.DataFrame(plots)
+    plots_df["quantity"] = (
+        plots_df["quantity"]
+        + (plots_df.groupby("quantity").cumcount() + 1).astype(str)
+    )
+
+    orientations = [o.strip() for o in orientation_var.get().split(",") if o.strip()]
+    if not orientations:
+        orientations = ["isometric"]
+
+    design_name = oProject.design_name
+
+    for idx, row in df.iterrows():
+        subfolder = os.path.join(
+            sanitize_path_part(design_name, 50),
+            build_variation_dir(idx, row)
+        )
+
+        ctk.CTkLabel(
+            table,
+            text="\\" + subfolder + "\\",
+            font=("Sitka Small", 12, "bold"),
+            text_color=LIGHT_GREEN,
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(10, 2))
+
+        for orient in orientations:
+            for _, p in plots_df.iterrows():
+                fname = build_filename(idx, row, orient, p["quantity"])
+                var = ctk.BooleanVar(value=True)
+
+                chk = ctk.CTkCheckBox(
+                    table,
+                    text=fname,
+                    variable=var,
+                    font=("Sitka Small", 11),
+                    text_color=WHITE,
+                    fg_color=LIGHT_GREEN,
+                    checkmark_color="black",
+                    hover_color=LIGHT_GREEN
+                )
+                chk.pack(anchor="w", padx=30, pady=2)
+
+                preview_rows.append((var, idx, row, orient, p, design_name))
+
+def map_surfaces_to_objects(surface_ids):
+    surface_ids = set(int(s) for s in surface_ids)
+    objs = []
+    for name in oProject.modeler.object_names:
+        try:
+            obj = oProject.modeler.get_object_from_name(name)
+            if int(obj.id) in surface_ids:
+                objs.append(name)
+        except:
+            pass
+    return list(dict.fromkeys(objs))
+
+def load_data():
+    aedt = aedt_entry.get().strip()
+    csvf = csv_entry.get().strip()
+
+    if not aedt:
+        messagebox.showerror("Error", "Select AEDT file")
+        return
+    if use_csv_var.get() and not csvf:
+        messagebox.showerror("Error", "CSV enabled but not selected")
+        return
+
+    if _busy():
+        messagebox.showinfo("Busy", "An export is still running.")
+        return
+
+    status_var.set("Opening AEDT / reading the parametric table ...")
+    app.update_idletasks()
+    try:
+        df = load_parametric_table(aedt, csvf, use_csv_var.get())
+        build_preview(df)
+    except Exception:
+        print(traceback.format_exc())
+        status_var.set("Load failed")
+        messagebox.showerror("Load failed", traceback.format_exc().strip().splitlines()[-1])
+        return
+
+    btn_export.configure(state="normal")
+    status_var.set(f"Loaded {len(df)} design point(s) - {len(preview_rows)} image(s) listed")
+
+def strip_logo(path, box=LOGO_BOX):
+    """Erase the "Ansys 2025 R2" stamp from an exported image.
+
+    Only pixels that are near-neutral (grey/black text) AND clearly different
+    from the surrounding background are replaced, so a coloured model that
+    reaches into the top-right corner is left alone. The background colour is
+    sampled from the box border rather than assumed white.
+    """
+    if Image is None:
+        return False
+    with Image.open(path) as src:
+        im = src.convert("RGB")
+    w, h = im.size
+    left, top = int(w * box[0]), int(h * box[1])
+    right, bottom = int(w * box[2]), int(h * box[3])
+    if right <= left or bottom <= top:
+        return False
+
+    crop = im.crop((left, top, right, bottom))
+    cw, ch = crop.size
+    px = crop.load()
+
+    # background = most common colour along the box border
+    border = [px[x, 0] for x in range(cw)] + [px[cw - 1, y] for y in range(ch)]
+    bg = max(set(border), key=border.count)
+
+    cleared = 0
+    for y in range(ch):
+        for x in range(cw):
+            r, g, b = px[x, y]
+            # the threshold has to be low: the stamp is antialiased, and JPEG
+            # leaves faint ringing around it that is still visible on white
+            neutral = max(r, g, b) - min(r, g, b) <= 40          # grey/black text
+            differs = (abs(r - bg[0]) + abs(g - bg[1]) + abs(b - bg[2])) > 9
+            if neutral and differs:
+                px[x, y] = bg
+                cleared += 1
+    if not cleared:
+        return False
+
+    im.paste(crop, (left, top))
+    im.save(path, quality=95)
+    return True
+
+def exports_root():
+    aedt = aedt_entry.get().strip()
+    if not aedt:
+        return ""
+    return os.path.join(os.path.dirname(aedt), "Exports")
+
+def _json_safe(v):
+    try:
+        if v is None or pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except (AttributeError, ValueError):
+            pass
+    if isinstance(v, (bool, int, float, str)):
+        return v
+    return str(v)
+
+def _sort_key(rec):
+    return (str(rec.get("design", "")), _json_safe(rec.get("row")) or 0,
+            rec.get("seq", 0))
+
+def write_manifest(base_dir, new_recs):
+    """Describe every exported image so the PPT step knows which design point,
+    variables, orientation and quantity each file belongs to. Entries survive
+    across runs (so a stopped-then-resumed export still builds a full report);
+    rows whose file has been deleted are dropped."""
+    path = os.path.join(base_dir, MANIFEST_NAME)
+    keep = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for rec in json.load(fh).get("images", []):
+                    rel = rec.get("path", "")
+                    if rel and os.path.isfile(os.path.join(base_dir, rel)):
+                        keep[rel] = rec
+        except Exception:
+            print("[Export] ! could not read the existing manifest, rewriting it")
+    for rec in new_recs:
+        keep[rec["path"]] = rec
+
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "images": sorted(keep.values(), key=_sort_key)},
+                  fh, indent=2)
+    return path
+
+# ---------------------------------------------------------------- status / busy
+def _busy():
+    return worker is not None and worker.is_alive()
+
+def _set_status(text):
+    """Safe from any thread - the main thread applies it in _pump_ui()."""
+    ui_queue.put(("status", str(text)[:110]))
+
+def _log(text):
+    print(text)
+    _set_status(text)
+
+def _fmt_hms(seconds):
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+def _refresh_progress(final=None):
+    """Redraw the counter / elapsed clock. Main thread only.
+
+    Called from _pump_ui on every tick, so the clock keeps ticking while AEDT
+    renders and the counter moves as soon as the worker reports an image.
+    """
+    done, total = export_state["done"], export_state["total"]
+    t0 = export_state["t0"]
+    elapsed = (time.time() - t0) if t0 else 0
+
+    progress_bar.set((done / total) if total else 0)
+
+    if final:
+        progress_var.set(f"{final}:  {done} / {total} exported   |   "
+                         f"total time {_fmt_hms(elapsed)}")
+        return
+    if not export_state["running"]:
+        progress_var.set("")
+        return
+
+    parts = [f"{done} / {total} exported", f"elapsed {_fmt_hms(elapsed)}"]
+    if done:
+        per = elapsed / done
+        parts.append(f"avg {per:.0f}s / image")
+        parts.append(f"ETA {_fmt_hms(per * (total - done))}")
+    progress_var.set("   |   ".join(parts))
+
+def _pump_ui():
+    """Main-thread pump: apply whatever the worker thread posted. It must always
+    re-arm itself -- if it ever died, every later status update would be lost."""
+    try:
+        while True:
+            try:
+                kind, payload = ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if kind == "status":
+                    status_var.set(payload)
+                elif kind == "progress":
+                    export_state["done"] = payload
+                elif kind == "export_done":
+                    _export_done(*payload)
+                elif kind == "ppt_done":
+                    _ppt_done(*payload)
+            except Exception:
+                print(traceback.format_exc())
+        if export_state["running"]:
+            _refresh_progress()
+    finally:
+        app.after(120, _pump_ui)
+
+def _set_running(running, allow_stop=True):
+    state = "disabled" if running else "normal"
+    for b in (btn_load, btn_select, btn_unselect, btn_export, btn_ppt):
+        b.configure(state=state)
+    btn_stop.configure(state="normal" if (running and allow_stop) else "disabled")
+
+# --------------------------------------------------------------------- export
+def export_selected():
+    """Start the export in a worker thread so the GUI (and the STOP button)
+    stays responsive while AEDT renders."""
+    global worker
+    if _busy():
+        return
+    if oProject is None:
+        messagebox.showerror("Error", "AEDT is not open. Press LOAD DATA first.")
+        return
+    if not preview_rows:
+        messagebox.showerror("Error", "Nothing to export. Press LOAD DATA first.")
+        return
+
+    base_dir = exports_root()
+    if not base_dir:
+        messagebox.showerror("Error", "Select the AEDT file first.")
+        return
+
+    # read the checkbox vars HERE (tk vars belong to the main thread)
+    jobs = [(seq, idx, row, orient, plot, design)
+            for seq, (var, idx, row, orient, plot, design) in enumerate(preview_rows)
+            if var.get()]
+    if not jobs:
+        messagebox.showerror("Error", "No images selected.")
+        return
+
+    hide_logo = True          # always strip the "Ansys <version>" stamp
+    if Image is None:
+        messagebox.showwarning("Pillow missing",
+                              "Pillow is not installed, so the Ansys stamp cannot "
+                              "be removed.\nThe images will keep it.\n\n"
+                              "Install it with:  pip install pillow")
+        hide_logo = False
+
+    os.makedirs(base_dir, exist_ok=True)
+    stop_event.clear()
+    export_state.update(done=0, total=len(jobs), t0=time.time(), running=True)
+    _refresh_progress()
+    _set_running(True)
+    worker = threading.Thread(target=_export_worker, args=(jobs, base_dir, hide_logo),
+                              daemon=True)
+    worker.start()
+
+def _export_worker(jobs, base_dir, hide_logo=False):
+    post = oProject.post
+    recs, done, stopped, err, released = [], 0, False, None, False
+    total = len(jobs)
+
+    try:
+        for n, (seq, idx, row, orient, plot, design_name) in enumerate(jobs, 1):
+            # the stop flag is checked BETWEEN images, so AEDT is never
+            # interrupted half-way through writing a JPG
+            if stop_event.is_set():
+                stopped = True
+                break
+
+            _log(f"[Export] {n}/{total}  case {idx}  {orient}  {plot['quantity']}")
+
+            for param_name, param_value in row.items():
+                if pd.notna(param_value):
+                    oProject[param_name] = param_value
+
+            post.plot_field_from_fieldplot(plot["plot"], show=False)
+            objs = map_surfaces_to_objects(plot["surfaces"])
+
+            out_dir = build_export_dir(base_dir, design_name, idx, row)
+            os.makedirs(out_dir, exist_ok=True)
+            fname = build_filename(idx, row, orient, plot["quantity"])
+            full = os.path.join(out_dir, fname)
+
+# Resolution: 4K UHD  & Size (px): 3840 × 2160
+            post.export_field_jpg(
+                full,
+                plot["plot"],
+                plot["folder"],
+                orientation=orient,
+                width=3840,
+                height=2160,
+                selections=objs,
+                show_axis=False,
+                show_grid=False,
+                show_ruler=False,
+                show_region=False
+            )
+
+            if hide_logo:
+                try:
+                    if not strip_logo(full):
+                        print(f"[Export] ! no Ansys stamp found to remove in {fname}")
+                except Exception:
+                    print(traceback.format_exc())
+
+            recs.append({
+                "path": os.path.relpath(full, base_dir),
+                "design": str(design_name),
+                "row": _json_safe(idx),
+                "params": {str(k): _json_safe(v) for k, v in row.items()
+                           if pd.notna(v)},
+                "orientation": orient,
+                "quantity": str(plot["quantity"]),
+                "plot": str(plot["plot"]),
+                "seq": seq,
+            })
+            done += 1
+            ui_queue.put(("progress", done))
+    except Exception:
+        err = traceback.format_exc()
+        print(err)
+
+    if recs:
+        try:
+            write_manifest(base_dir, recs)
+        except Exception:
+            print(traceback.format_exc())
+
+    if stopped:
+        _log("[Export] stop requested -> closing AEDT ...")
+        try:
+            oProject.release_desktop()
+            released = True
+        except Exception:
+            print(traceback.format_exc())
+
+    ui_queue.put(("export_done", (done, total, stopped, err, released, base_dir)))
+
+def _export_done(done, total, stopped, err, released, base_dir):
+    global oProject
+    export_state["done"] = done
+    export_state["running"] = False
+    _refresh_progress(final="Failed" if err else ("Stopped" if stopped else "Complete"))
+    elapsed = _fmt_hms(time.time() - export_state["t0"]) if export_state["t0"] else "-"
+
+    if released:
+        oProject = None
+        for wdg in table.winfo_children():
+            wdg.destroy()
+        preview_rows.clear()
+
+    _set_running(False)
+    if released:
+        btn_export.configure(state="disabled")
+
+    if err:
+        _set_status(f"Failed after {done}/{total} - {elapsed}")
+        messagebox.showerror("Export failed",
+                             f"Exported {done} of {total} in {elapsed} before the error."
+                             f"\n\n{err.strip().splitlines()[-1]}")
+    elif stopped:
+        _set_status(f"Stopped at {done}/{total} after {elapsed} - AEDT closed")
+        messagebox.showinfo("Stopped",
+                            f"Export stopped safely after {done} of {total} image(s).\n"
+                            f"Time elapsed: {elapsed}\n"
+                            f"AEDT has been closed.\n\n{base_dir}")
+    else:
+        _set_status(f"Export complete - {done} image(s) in {elapsed}")
+        messagebox.showinfo("Done",
+                            f"Export complete: {done} image(s)\n"
+                            f"Time elapsed: {elapsed}\n\n{base_dir}")
+
+# ------------------------------------------------------------- stop / close
+def stop_and_close():
+    """Stop the export loop between two images, then close AEDT cleanly.
+    With no export running it just closes AEDT."""
+    if _busy():
+        stop_event.set()
+        btn_stop.configure(state="disabled")
+        _set_status("Stop requested - finishing the current image, then closing AEDT ...")
+        return
+    if oProject is None:
+        messagebox.showinfo("AEDT", "AEDT is not open.")
+        return
+    if not messagebox.askyesno("Close AEDT",
+                               "No export is running.\nClose the AEDT session now?"):
+        return
+    close_aedt()
+
+def close_aedt():
+    global oProject
+    if oProject is None:
+        return
+    _set_status("Closing AEDT ...")
+    try:
+        oProject.release_desktop()
+    except Exception:
+        print(traceback.format_exc())
+    oProject = None
+    for wdg in table.winfo_children():
+        wdg.destroy()
+    preview_rows.clear()
+    btn_export.configure(state="disabled")
+    _set_status("AEDT closed")
+
+# ------------------------------------------------------------------ PPT step
+def load_images_to_ppt():
+    """Fill the Results section of the report template with the exported
+    images - two images per slide."""
+    global worker
+    if _busy():
+        return
+    if ppt_core is None:
+        messagebox.showerror("PPT unavailable",
+                             "Could not load ppt_report_core.py.\n\n"
+                             f"{_PPT_IMPORT_ERROR}\n\n"
+                             "Install python-pptx:  pip install python-pptx")
+        return
+
+    # new report from the template, or add a Results section to an existing one?
+    use_existing = messagebox.askyesnocancel(
+        "Load images to PPT",
+        "Add the results to an EXISTING report?\n\n"
+        "Yes  -  pick an existing .pptx; the new slides go into a\n"
+        "         new \"Results\" section and nothing is removed.\n\n"
+        "No   -  build a new report from the template:\n"
+        f"         {os.path.basename(ppt_entry.get().strip() or 'Report_Template.pptx')}"
+    )
+    if use_existing is None:
+        return
+
+    if use_existing:
+        source = filedialog.askopenfilename(
+            title="Select the existing report to add the results to",
+            filetypes=[("PowerPoint", "*.pptx")],
+            initialdir=os.path.dirname(ppt_entry.get().strip()) or _HERE)
+        if not source:
+            return
+    else:
+        source = ppt_entry.get().strip()
+        if not os.path.isfile(source):
+            messagebox.showerror("Error", "Select the report template (.pptx) first.")
+            return
+    try:
+        with open(source, "rb"):
+            pass
+    except OSError:
+        messagebox.showerror("File locked",
+                             "This presentation cannot be read - it is open in "
+                             "PowerPoint.\nClose it and try again:\n\n" + source)
+        return
+
+    base_dir = exports_root()
+    if not base_dir or not os.path.isfile(os.path.join(base_dir, MANIFEST_NAME)):
+        picked = filedialog.askdirectory(
+            title="Select the Exports folder (the one holding " + MANIFEST_NAME + ")")
+        if not picked:
+            return
+        base_dir = picked
+
+    manifest = os.path.join(base_dir, MANIFEST_NAME)
+    if not os.path.isfile(manifest):
+        messagebox.showerror("No exported images",
+                             f"{MANIFEST_NAME} not found in:\n{base_dir}\n\n"
+                             "Export the images first.")
+        return
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            recs = json.load(fh).get("images", [])
+    except Exception as e:
+        messagebox.showerror("Manifest unreadable", str(e))
+        return
+    if not recs:
+        messagebox.showerror("No exported images", f"{manifest} is empty.")
+        return
+
+    # existing report -> default to saving back over it (that is "add to it");
+    # template -> never overwrite, so suggest a separate report file
+    if use_existing:
+        out = filedialog.asksaveasfilename(
+            title="Save the updated report as (keep the name to update it in place)",
+            defaultextension=".pptx",
+            initialfile=os.path.basename(source),
+            initialdir=os.path.dirname(source) or _HERE,
+            filetypes=[("PowerPoint", "*.pptx")]
+        )
+    else:
+        out = filedialog.asksaveasfilename(
+            title="Save the new report as",
+            defaultextension=".pptx",
+            initialfile="Results_Report.pptx",
+            initialdir=os.path.dirname(base_dir) or _HERE,
+            filetypes=[("PowerPoint", "*.pptx")]
+        )
+    if not out:
+        return
+    if not use_existing and os.path.abspath(out) == os.path.abspath(source):
+        messagebox.showerror("Error",
+                             "That would overwrite the template.\n"
+                             "Choose a different output file.")
+        return
+
+    _set_running(True, allow_stop=False)
+    worker = threading.Thread(target=_ppt_worker,
+                              args=(source, out, recs, base_dir, bool(use_existing)),
+                              daemon=True)
+    worker.start()
+
+def _ppt_worker(source, out, recs, base_dir, use_existing=False):
+    err, slides, imgs = None, 0, 0
+    try:
+        _log(f"[PPT] building from {len(recs)} exported image(s) ...")
+        slides, imgs = ppt_core.build_results_deck(
+            source, out, recs, base_dir, log=_log,
+            # adding to a report the user already has: keep every existing
+            # slide and pattern from the LAST results slide
+            keep_template_slide=use_existing,
+            append_after_last=use_existing,
+            make_section=True,      # keeps the deck's section list valid
+        )
+    except Exception:
+        err = traceback.format_exc()
+        print(err)
+    ui_queue.put(("ppt_done", (slides, imgs, out, err)))
+
+def _ppt_done(slides, imgs, out, err):
+    _set_running(False)
+    if oProject is None:
+        btn_export.configure(state="disabled")
+    if err:
+        _set_status("PPT build failed")
+        messagebox.showerror("PPT failed", err.strip().splitlines()[-1])
+        return
+    _set_status(f"PPT ready - {slides} results slide(s)")
+    if messagebox.askyesno("PPT ready",
+                           f"{slides} results slide(s), {imgs} image(s):\n{out}\n\n"
+                           "Open it now?"):
+        try:
+            os.startfile(out)
+        except Exception:
+            print(traceback.format_exc())
+
+def select_all():
+    for v, *_ in preview_rows:
+        v.set(True)
+
+def unselect_all():
+    for v, *_ in preview_rows:
+        v.set(False)
+
+def on_close():
+    global oProject
+    if _busy():
+        if not messagebox.askyesno("Export running",
+                                   "An export is still running.\n"
+                                   "Stop it and close AEDT now?"):
+            return
+        stop_event.set()
+    if oProject:
+        try:
+            oProject.release_desktop()
+        except:
+            pass
+        oProject = None
+    app.destroy()
+
+app.protocol("WM_DELETE_WINDOW", on_close)
+
+btns = ctk.CTkFrame(app, fg_color="transparent")
+btns.pack(pady=(10, 2))
+
+btn_load = ctk.CTkButton(
+    btns, text="LOAD DATA",
+    width=160, height=36,
+    fg_color=MAIN_RED,
+    hover_color=LIGHT_GREEN,
+    font=("Sitka Small", 12),
+    command=load_data
+)
+btn_load.pack(side="left", padx=6)
+
+btn_select = ctk.CTkButton(
+    btns, text="SELECT ALL",
+    width=140, height=36,
+    fg_color=MAIN_RED,
+    hover_color=DARKER_RED,
+    font=("Sitka Small", 12),
+    command=select_all
+)
+btn_select.pack(side="left", padx=6)
+
+btn_unselect = ctk.CTkButton(
+    btns, text="UNSELECT ALL",
+    width=160, height=36,
+    fg_color=MAIN_RED,
+    hover_color=DARKER_RED,
+    font=("Sitka Small", 12),
+    command=unselect_all
+)
+btn_unselect.pack(side="left", padx=6)
+
+btns2 = ctk.CTkFrame(app, fg_color="transparent")
+btns2.pack(pady=(2, 2))
+
+btn_export = ctk.CTkButton(
+    btns2, text="EXPORT IMAGES",
+    width=170, height=36,
+    fg_color=MAIN_RED,
+    hover_color=LIGHT_GREEN,
+    font=("Sitka Small", 12),
+    command=export_selected
+)
+btn_export.pack(side="left", padx=6)
+
+btn_stop = ctk.CTkButton(
+    btns2, text="STOP & CLOSE AEDT",
+    width=190, height=36,
+    fg_color=DARKER_RED,
+    hover_color=MAIN_RED,
+    font=("Sitka Small", 12),
+    state="disabled",
+    command=stop_and_close
+)
+btn_stop.pack(side="left", padx=6)
+
+btn_ppt = ctk.CTkButton(
+    btns2, text="LOAD IMAGES TO PPT",
+    width=200, height=36,
+    fg_color=MAIN_RED,
+    hover_color=LIGHT_GREEN,
+    font=("Sitka Small", 12),
+    command=load_images_to_ppt
+)
+btn_ppt.pack(side="left", padx=6)
+
+progress_bar = ctk.CTkProgressBar(
+    app, width=520, height=12,
+    fg_color="#2A2A2A", progress_color=LIGHT_GREEN
+)
+progress_bar.set(0)
+progress_bar.pack(pady=(8, 4))
+
+progress_var = tk.StringVar(value="")
+ctk.CTkLabel(
+    app,
+    textvariable=progress_var,
+    font=("Sitka Small", 12),
+    text_color=WHITE
+).pack()
+
+status_var = tk.StringVar(value="Ready")
+ctk.CTkLabel(
+    app,
+    textvariable=status_var,
+    font=("Sitka Small", 11),
+    text_color=LIGHT_GREEN
+).pack(pady=(2, 8))
+
+app.after(120, _pump_ui)
+
+footer = ctk.CTkFrame(app, fg_color=WHITE)
+footer.pack(fill="x", side="bottom")
+
+footer_center = ctk.CTkFrame(footer, fg_color="transparent")
+footer_center.pack(pady=2)
+
+scroll_text = "       For Support or Queries, Contact: Karthik G S        "
+scroll_var = tk.StringVar(value=scroll_text)
+
+scroll_lbl = ctk.CTkLabel(
+    footer_center,
+    textvariable=scroll_var,
+    text_color=BLACK,
+    font=("Sitka Small", 8),
+    fg_color=WHITE
+)
+scroll_lbl.pack()
+
+def scroll():
+    t = scroll_var.get()
+    scroll_var.set(t[1:] + t[0])
+    scroll_lbl.after(120, scroll)
+
+scroll()
+
+molex = ctk.CTkFrame(footer_center, fg_color="transparent")
+molex.pack()
+
+ctk.CTkLabel(
+    molex, text="molex",
+    font=("Arial Black", 25),
+    text_color="red"
+).pack(side="left", padx=10)
+
+ctk.CTkLabel(
+    molex, text="Creating Connections for Life",
+    font=("Segoe Print", 9),
+    text_color=BLACK
+).pack(side="left", padx=4)
+
+
+# guarded so the module can also be imported (headless testing) without the
+# window taking over the process
+if __name__ == "__main__":
+    app.mainloop()
