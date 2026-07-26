@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""
+Phase 1.1 - CAD part names -> Excel
+====================================
+Pick a STEP CAD file and a material Excel. Part/body names are read from the
+CAD (PRODUCT entities, in file order) and written into the Material_Data
+sheet's "Part Name" column, one per row, starting at the first data row.
+
+The CAD and Excel paths are remembered between runs in
+phase1.1_gui_config.json beside this script.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+from openpyxl import load_workbook
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_PATH = os.path.join(_HERE, "phase1.1_gui_config.json")
+DEFAULT_EXCEL = os.path.join(_HERE, "Material Data for Simulation.xlsx")
+DEFAULT_CAD = os.path.join(_HERE, "Phase2_cad.stp")
+
+BG = "#f4f6f8"
+CARD = "#ffffff"
+ACCENT = "#c00000"
+INK = "#1f2937"
+MUTE = "#6b7280"
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# Body/shell entities that carry an individual part/body name. These are the
+# actual parts (one AEDT object each); the PRODUCT entity is only the top-level
+# design container (e.g. 'Design5'), which is NOT what we want per row.
+_STEP_BODY_RE = re.compile(
+    r"=\s*(?:MANIFOLD_SOLID_BREP|BREP_WITH_VOIDS|FACETED_BREP|SHELL_BASED_SURFACE_MODEL)"
+    r"\s*\(\s*'((?:[^']|'')*)'")
+_STEP_PRODUCT_RE = re.compile(r"PRODUCT\s*\(\s*'((?:[^']|'')*)'")
+
+
+def extract_step_part_names(path):
+    """Part/body names from a STEP file, in file order.
+
+    Prefers the named solid/shell bodies (MANIFOLD_SOLID_BREP,
+    SHELL_BASED_SURFACE_MODEL, ...) - one row per body, no dedup, since two
+    parts may legitimately share a name. Falls back to PRODUCT names (a
+    single-part export or assembly) when no bodies carry names, collapsing the
+    doubled definition many exporters emit.
+    """
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+
+    bodies = [m.replace("''", "'").strip() for m in _STEP_BODY_RE.findall(text)]
+    bodies = [b for b in bodies if b]
+    if bodies:
+        return bodies
+
+    names = []
+    for m in _STEP_PRODUCT_RE.findall(text):
+        n = m.replace("''", "'").strip()
+        if n and (not names or names[-1] != n):
+            names.append(n)
+    return names
+
+
+def _is_subheader_row(ws, row):
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=row, column=c).value
+        if v is None:
+            continue
+        s = str(v).strip().lower()
+        if s in ("x", "y", "z") or s.startswith("(") or "gravity" in s:
+            return True
+    return False
+
+
+def _find_part_name_cell(ws, max_header_rows=5):
+    """Locate the 'Part Name' header and return (col, first_data_row)."""
+    for r in range(1, max_header_rows + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            if v and "part" in str(v).strip().lower():
+                data_start = r + 2 if _is_subheader_row(ws, r + 1) else r + 1
+                return c, data_start
+    return None, None
+
+
+def fill_part_names(excel_path, names, sheet_name="Material_Data"):
+    """Write `names` into the Part Name column, one per row, in order."""
+    wb = load_workbook(excel_path)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Sheet '{sheet_name}' not found in {os.path.basename(excel_path)}")
+    ws = wb[sheet_name]
+    col, data_start = _find_part_name_cell(ws)
+    if col is None:
+        raise ValueError(f"No 'Part Name' column found in '{sheet_name}'")
+    for i, name in enumerate(names):
+        ws.cell(row=data_start + i, column=col, value=name)
+    wb.save(excel_path)
+    return data_start
+
+
+class Phase11GUI:
+    def __init__(self, root):
+        self.root = root
+        self.cfg = load_config()
+
+        root.title("Phase 1.1  -  CAD Part Names -> Excel")
+        root.configure(bg=BG)
+        root.minsize(680, 420)
+
+        self._style()
+        self._header()
+        self._form()
+        self._actions()
+        self._logbox()
+
+        self._load_fields()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---- style / layout
+    def _style(self):
+        st = ttk.Style()
+        try:
+            st.theme_use("clam")
+        except Exception:  # noqa: BLE001
+            pass
+        st.configure("TFrame", background=BG)
+        st.configure("TLabel", background=CARD, foreground=INK, font=("Segoe UI", 10))
+        st.configure("Head.TLabel", background=BG, foreground=INK, font=("Segoe UI Semibold", 17))
+        st.configure("Sub.TLabel", background=BG, foreground=MUTE, font=("Segoe UI", 9))
+        st.configure("Field.TLabel", background=CARD, foreground=MUTE, font=("Segoe UI", 9))
+        st.configure("Run.TButton", font=("Segoe UI Semibold", 11), foreground="#ffffff",
+                     background=ACCENT, borderwidth=0, padding=(16, 9))
+        st.map("Run.TButton", background=[("active", "#9e0000"), ("disabled", "#d9a3a3")])
+        st.configure("TButton", font=("Segoe UI", 9), padding=(10, 5))
+
+    def _header(self):
+        top = tk.Frame(self.root, bg=BG)
+        top.pack(fill="x", padx=20, pady=(16, 6))
+        ttk.Label(top, text="Phase 1.1  -  CAD Part Names -> Excel", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(top, text="Pick a STEP file and a material Excel; part names are read from "
+                            "the CAD in order and written into the Part Name column.",
+                  style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+        tk.Frame(self.root, bg=ACCENT, height=3).pack(fill="x", padx=20)
+
+    def _card(self):
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill="x", padx=20, pady=(12, 0))
+        card = tk.Frame(outer, bg=CARD, highlightbackground="#e5e7eb", highlightthickness=1)
+        card.pack(fill="x")
+        return card
+
+    def _form(self):
+        card = self._card()
+        card.columnconfigure(1, weight=1)
+        self.cad = self._file_row(card, 0, "CAD (STEP) FILE", self._pick_cad)
+        self.excel = self._file_row(card, 1, "MATERIAL EXCEL", self._pick_excel)
+
+    def _file_row(self, card, r, label, cmd):
+        ttk.Label(card, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=14, pady=7)
+        row = tk.Frame(card, bg=CARD)
+        row.grid(row=r, column=1, sticky="ew", padx=14, pady=7)
+        row.columnconfigure(0, weight=1)
+        ent = ttk.Entry(row, font=("Segoe UI", 10))
+        ent.grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="Browse", command=cmd).grid(row=0, column=1, padx=(8, 0))
+        return ent
+
+    def _actions(self):
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x", padx=20, pady=(14, 4))
+        ttk.Button(bar, text="Fill Part Names -> Excel", style="Run.TButton",
+                   command=self._fill_part_names).pack(side="left")
+
+    def _logbox(self):
+        wrap = tk.Frame(self.root, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=20, pady=(8, 16))
+        self.log = tk.Text(wrap, bg="#0f172a", fg="#e2e8f0", insertbackground="#e2e8f0",
+                           font=("Consolas", 9), relief="flat", wrap="word", height=10)
+        self.log.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(wrap, command=self.log.yview)
+        sb.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=sb.set, state="disabled")
+
+    # ---- fields <-> config
+    def _load_fields(self):
+        self.cad.insert(0, self.cfg.get("cad", DEFAULT_CAD))
+        self.excel.insert(0, self.cfg.get("excel", DEFAULT_EXCEL))
+
+    def _cfg(self):
+        return {"cad": self.cad.get().strip(), "excel": self.excel.get().strip()}
+
+    def _pick_cad(self):
+        f = filedialog.askopenfilename(title="CAD file",
+                                       filetypes=[("STEP", "*.stp *.step"), ("All", "*.*")],
+                                       initialdir=os.path.dirname(self.cad.get() or _HERE))
+        if f:
+            self.cad.delete(0, "end")
+            self.cad.insert(0, f)
+
+    def _pick_excel(self):
+        f = filedialog.askopenfilename(title="Material Excel",
+                                       filetypes=[("Excel", "*.xlsx *.xlsm"), ("All", "*.*")],
+                                       initialdir=os.path.dirname(self.excel.get() or _HERE))
+        if f:
+            self.excel.delete(0, "end")
+            self.excel.insert(0, f)
+
+    # ---- logging
+    def _append(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    # ---- action
+    def _fill_part_names(self):
+        cad_path = self.cad.get().strip()
+        if not cad_path or not os.path.isfile(cad_path):
+            messagebox.showerror("Missing CAD", f"CAD not found:\n{cad_path}")
+            return
+        if not cad_path.lower().endswith((".stp", ".step")):
+            messagebox.showerror("Unsupported format",
+                                 "Part-name extraction supports STEP (.stp/.step) files only.")
+            return
+        excel_path = self.excel.get().strip()
+        if not excel_path or not os.path.isfile(excel_path):
+            messagebox.showerror("Missing Excel", f"Excel not found:\n{excel_path}")
+            return
+
+        save_config(self._cfg())
+
+        try:
+            names = extract_step_part_names(cad_path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Read failed", f"Could not read the CAD file:\n{exc}")
+            return
+        if not names:
+            messagebox.showwarning("No parts found", "No PRODUCT names were found in the STEP file.")
+            return
+
+        preview = "\n".join(f"{i + 1}. {n}" for i, n in enumerate(names[:20]))
+        if len(names) > 20:
+            preview += f"\n... and {len(names) - 20} more"
+        if not messagebox.askyesno(
+                "Confirm part names",
+                f"Found {len(names)} part name(s) in order:\n\n{preview}\n\n"
+                f"Write these into '{os.path.basename(excel_path)}' "
+                f"(Material_Data, Part Name column)?"):
+            return
+
+        try:
+            start_row = fill_part_names(excel_path, names)
+        except PermissionError:
+            messagebox.showerror("Excel is open",
+                                 f"Close '{os.path.basename(excel_path)}' in Excel and try again.")
+            return
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Write failed", f"Could not update the Excel file:\n{exc}")
+            return
+
+        self._append(f"[Part Names] {len(names)} name(s) from {os.path.basename(cad_path)} "
+                     f"-> {os.path.basename(excel_path)} "
+                     f"(rows {start_row}-{start_row + len(names) - 1})\n")
+        messagebox.showinfo("Part Names", f"Wrote {len(names)} part name(s) into the Excel file.")
+
+    def _on_close(self):
+        save_config(self._cfg())
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    Phase11GUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
