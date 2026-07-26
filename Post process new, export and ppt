@@ -156,14 +156,22 @@ if os.path.isfile(DEFAULT_TEMPLATE):
     ppt_entry.insert(0, DEFAULT_TEMPLATE)
 
 def browse_ppt():
-    p = filedialog.askopenfilename(filetypes=[("PowerPoint", "*.pptx")])
+    """Pick the report TEMPLATE. Whatever is in this field is what
+    LOAD IMAGES TO PPT uses - it never asks for the template again."""
+    current = ppt_entry.get().strip()
+    p = filedialog.askopenfilename(
+        title="Select the report template (PPTX)",
+        filetypes=[("PowerPoint", "*.pptx")],
+        initialdir=os.path.dirname(current) if current else _HERE,
+        initialfile=os.path.basename(current) if current else ""
+    )
     if p:
         ppt_entry.delete(0, tk.END)
         ppt_entry.insert(0, p)
 
 ctk.CTkButton(
-    ppt_frame, text="PPT Browse",
-    width=100, height=30,
+    ppt_frame, text="Template Browse",
+    width=120, height=30,
     fg_color=MAIN_RED, hover_color=DARKER_RED,
     font=("Sitka Small", 12),
     command=browse_ppt
@@ -758,37 +766,17 @@ def load_images_to_ppt():
                              "Install python-pptx:  pip install python-pptx")
         return
 
-    # new report from the template, or add a Results section to an existing one?
-    use_existing = messagebox.askyesnocancel(
-        "Load images to PPT",
-        "Add the results to an EXISTING report?\n\n"
-        "Yes  -  pick an existing .pptx; the new slides go into a\n"
-        "         new \"Results\" section and nothing is removed.\n\n"
-        "No   -  build a new report from the template:\n"
-        f"         {os.path.basename(ppt_entry.get().strip() or 'Report_Template.pptx')}"
-    )
-    if use_existing is None:
+    template = ppt_entry.get().strip()
+    if not os.path.isfile(template):
+        messagebox.showerror("Error", "Select the report template (.pptx) first.")
         return
-
-    if use_existing:
-        source = filedialog.askopenfilename(
-            title="Select the existing report to add the results to",
-            filetypes=[("PowerPoint", "*.pptx")],
-            initialdir=os.path.dirname(ppt_entry.get().strip()) or _HERE)
-        if not source:
-            return
-    else:
-        source = ppt_entry.get().strip()
-        if not os.path.isfile(source):
-            messagebox.showerror("Error", "Select the report template (.pptx) first.")
-            return
     try:
-        with open(source, "rb"):
+        with open(template, "rb"):
             pass
     except OSError:
-        messagebox.showerror("File locked",
-                             "This presentation cannot be read - it is open in "
-                             "PowerPoint.\nClose it and try again:\n\n" + source)
+        messagebox.showerror("Template locked",
+                             "The template cannot be read - it is open in "
+                             "PowerPoint.\nClose it and try again:\n\n" + template)
         return
 
     base_dir = exports_root()
@@ -815,50 +803,29 @@ def load_images_to_ppt():
         messagebox.showerror("No exported images", f"{manifest} is empty.")
         return
 
-    # existing report -> default to saving back over it (that is "add to it");
-    # template -> never overwrite, so suggest a separate report file
-    if use_existing:
-        out = filedialog.asksaveasfilename(
-            title="Save the updated report as (keep the name to update it in place)",
-            defaultextension=".pptx",
-            initialfile=os.path.basename(source),
-            initialdir=os.path.dirname(source) or _HERE,
-            filetypes=[("PowerPoint", "*.pptx")]
-        )
-    else:
-        out = filedialog.asksaveasfilename(
-            title="Save the new report as",
-            defaultextension=".pptx",
-            initialfile="Results_Report.pptx",
-            initialdir=os.path.dirname(base_dir) or _HERE,
-            filetypes=[("PowerPoint", "*.pptx")]
-        )
+    out = filedialog.asksaveasfilename(
+        title="Save the report as",
+        defaultextension=".pptx",
+        initialfile="Results_Report.pptx",
+        initialdir=os.path.dirname(base_dir) or _HERE,
+        filetypes=[("PowerPoint", "*.pptx")]
+    )
     if not out:
         return
-    if not use_existing and os.path.abspath(out) == os.path.abspath(source):
-        messagebox.showerror("Error",
-                             "That would overwrite the template.\n"
-                             "Choose a different output file.")
+    if os.path.abspath(out) == os.path.abspath(template):
+        messagebox.showerror("Error", "Choose an output file different from the template.")
         return
 
     _set_running(True, allow_stop=False)
-    worker = threading.Thread(target=_ppt_worker,
-                              args=(source, out, recs, base_dir, bool(use_existing)),
+    worker = threading.Thread(target=_ppt_worker, args=(template, out, recs, base_dir),
                               daemon=True)
     worker.start()
 
-def _ppt_worker(source, out, recs, base_dir, use_existing=False):
+def _ppt_worker(template, out, recs, base_dir):
     err, slides, imgs = None, 0, 0
     try:
         _log(f"[PPT] building from {len(recs)} exported image(s) ...")
-        slides, imgs = ppt_core.build_results_deck(
-            source, out, recs, base_dir, log=_log,
-            # adding to a report the user already has: keep every existing
-            # slide and pattern from the LAST results slide
-            keep_template_slide=use_existing,
-            append_after_last=use_existing,
-            make_section=True,      # keeps the deck's section list valid
-        )
+        slides, imgs = ppt_core.build_results_deck(template, out, recs, base_dir, log=_log)
     except Exception:
         err = traceback.format_exc()
         print(err)
