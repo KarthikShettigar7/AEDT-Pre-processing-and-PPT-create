@@ -107,7 +107,12 @@ def _find_part_name_cell(ws, max_header_rows=5):
 
 def fill_part_names(excel_path, names, sheet_name="Material_Data"):
     """Write `names` into the Part Name column, one per row, in order."""
-    wb = load_workbook(excel_path)
+    # .xlsm/.xltm are macro-enabled: load with keep_vba=True so the VBA/macro part
+    # survives the save. Without it openpyxl drops the macros and writes plain-xlsx
+    # content under the .xlsm name, so Excel then reports the file as corrupt
+    # ("file format or file extension is not valid").
+    keep_vba = excel_path.lower().endswith((".xlsm", ".xltm"))
+    wb = load_workbook(excel_path, keep_vba=keep_vba)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Sheet '{sheet_name}' not found in {os.path.basename(excel_path)}")
     ws = wb[sheet_name]
@@ -127,7 +132,7 @@ class Phase11GUI:
 
         root.title("Phase 1.1  -  CAD Part Names -> Excel")
         root.configure(bg=BG)
-        root.minsize(680, 420)
+        root.minsize(680, 460)
 
         self._style()
         self._header()
@@ -159,8 +164,9 @@ class Phase11GUI:
         top = tk.Frame(self.root, bg=BG)
         top.pack(fill="x", padx=20, pady=(16, 6))
         ttk.Label(top, text="Phase 1.1  -  CAD Part Names -> Excel", style="Head.TLabel").pack(anchor="w")
-        ttk.Label(top, text="Pick a STEP file and a material Excel; part names are read from "
-                            "the CAD in order and written into the Part Name column.",
+        ttk.Label(top, text="Select a project folder to auto-detect the CAD + Excel (or set them "
+                            "manually); part names are read from the CAD in order and written "
+                            "into the Part Name column.",
                   style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
         tk.Frame(self.root, bg=ACCENT, height=3).pack(fill="x", padx=20)
 
@@ -174,8 +180,10 @@ class Phase11GUI:
     def _form(self):
         card = self._card()
         card.columnconfigure(1, weight=1)
-        self.cad = self._file_row(card, 0, "CAD (STEP) FILE", self._pick_cad)
-        self.excel = self._file_row(card, 1, "MATERIAL EXCEL", self._pick_excel)
+        # PROJECT FOLDER -> auto-detect the CAD + Excel inside it (like Phase 4)
+        self.folder = self._file_row(card, 0, "PROJECT FOLDER", self._pick_folder)
+        self.cad = self._file_row(card, 1, "CAD (STEP) FILE", self._pick_cad)
+        self.excel = self._file_row(card, 2, "MATERIAL EXCEL", self._pick_excel)
 
     def _file_row(self, card, r, label, cmd):
         ttk.Label(card, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=14, pady=7)
@@ -205,11 +213,85 @@ class Phase11GUI:
 
     # ---- fields <-> config
     def _load_fields(self):
+        self.folder.insert(0, self.cfg.get("folder", ""))
         self.cad.insert(0, self.cfg.get("cad", DEFAULT_CAD))
         self.excel.insert(0, self.cfg.get("excel", DEFAULT_EXCEL))
 
     def _cfg(self):
-        return {"cad": self.cad.get().strip(), "excel": self.excel.get().strip()}
+        return {"folder": self.folder.get().strip(),
+                "cad": self.cad.get().strip(), "excel": self.excel.get().strip()}
+
+    # ---- project folder -> auto-detect CAD + Excel (same behaviour as Phase 4)
+    _EXCEL_EXTS = (".xlsx", ".xlsm")
+    _CAD_EXTS = (".stp", ".step", ".igs", ".iges", ".x_t", ".sat")
+
+    @staticmethod
+    def _num_prefix(name):
+        """Leading number before the first underscore (e.g. '143_GC.stp' -> '143')."""
+        if not name:
+            return None
+        m = re.match(r"\s*(\d+)_", os.path.basename(name))
+        return m.group(1) if m else None
+
+    def _pick_folder(self):
+        d = filedialog.askdirectory(title="Project folder",
+                                    initialdir=self.folder.get() or _HERE)
+        if d:
+            self.folder.delete(0, "end")
+            self.folder.insert(0, d)
+            self._scan_folder(d)
+
+    def _scan_folder(self, folder):
+        """Detect the CAD + Excel in `folder` by extension (not exact name), fill
+        both fields, and WARN (never block) on a missing or mismatched NN_ number
+        prefix -- so the CAD and Excel you prep belong to the same project."""
+        try:
+            entries = sorted(os.listdir(folder))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Folder", f"Cannot read folder:\n{e}")
+            return
+
+        def _pick(exts):
+            cands = [f for f in entries
+                     if f.lower().endswith(exts) and not f.startswith("~$")]
+            if not cands:
+                return None
+            pref = [f for f in cands if re.match(r"\s*\d+_", f)]   # prefer NN_ names
+            return (pref or cands)[0]
+
+        excel = _pick(self._EXCEL_EXTS)
+        cad = _pick(self._CAD_EXTS)
+        warn = []
+        if cad:
+            self.cad.delete(0, "end")
+            self.cad.insert(0, os.path.join(folder, cad))
+        else:
+            warn.append("No CAD (.stp/.step/.igs/.x_t/.sat) found in the folder.")
+        if excel:
+            self.excel.delete(0, "end")
+            self.excel.insert(0, os.path.join(folder, excel))
+        else:
+            warn.append("No Excel (.xlsx/.xlsm) found in the folder.")
+
+        n_xl = self._num_prefix(excel)
+        n_cad = self._num_prefix(cad)
+        if excel and n_xl is None:
+            warn.append(f"Excel '{excel}' has no NN_ number prefix.")
+        if cad and n_cad is None:
+            warn.append(f"CAD '{cad}' has no NN_ number prefix.")
+        if n_xl and n_cad and n_xl != n_cad:
+            warn.append(f"Number prefix differs -> Excel={n_xl}, CAD={n_cad}.")
+
+        self._append(f"[Folder] {folder}\n")
+        if cad:
+            self._append(f"  CAD   : {cad}\n")
+        if excel:
+            self._append(f"  Excel : {excel}\n")
+        if warn:
+            self._append("  ! " + "\n  ! ".join(warn) + "\n")
+            messagebox.showwarning(
+                "Folder scan",
+                "\n".join(warn) + "\n\nYou can still proceed - edit any field manually.")
 
     def _pick_cad(self):
         f = filedialog.askopenfilename(title="CAD file",
