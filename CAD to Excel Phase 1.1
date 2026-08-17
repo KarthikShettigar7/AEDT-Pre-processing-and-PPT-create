@@ -14,11 +14,59 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+# ---------------------------------------------------------------------------
+# Startup dependency check -- runs BEFORE the GUI needs anything, so this
+# script works on a fresh machine without a manual setup step. tkinter/json/
+# os/re/subprocess/sys are all stdlib; 'openpyxl' is the only third-party
+# package, auto-installed via pip if missing.
+# ---------------------------------------------------------------------------
+def _fatal(message):
+    """Report a startup failure to the console and, if possible, a GUI dialog
+    (tkinter may itself be unavailable on a minimal Python install)."""
+    print(f"[Phase1.1] FATAL: {message}")
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _r = _tk.Tk()
+        _r.withdraw()
+        _mb.showerror("Phase 1.1 - startup error", message)
+        _r.destroy()
+    except Exception:  # noqa: BLE001
+        pass
+    raise SystemExit(1)
 
-from openpyxl import load_workbook
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+except ImportError:
+    _fatal("Python's 'tkinter' module is not available.\n\n"
+          "Install Python from python.org with the 'tcl/tk' option enabled, "
+          "or on Linux install the OS package (e.g. 'sudo apt install python3-tk').")
+
+
+def _ensure_openpyxl():
+    try:
+        import openpyxl  # noqa: F401
+        return
+    except ImportError:
+        pass
+    print("[Phase1.1] 'openpyxl' not found -- installing (pip) ...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "openpyxl"])
+        import openpyxl  # noqa: F401
+        print("[Phase1.1] 'openpyxl' installed OK")
+    except Exception as e:  # noqa: BLE001
+        _fatal(f"Could not install the required 'openpyxl' package.\n\nError: {e}\n\n"
+              f"Please run this manually, then re-launch:\n"
+              f"    {sys.executable} -m pip install openpyxl")
+
+
+_ensure_openpyxl()
+from openpyxl import load_workbook  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
